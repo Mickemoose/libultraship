@@ -19,7 +19,25 @@ ControlDeck::ControlDeck(std::vector<CONTROLLERBUTTONS_T> additionalBitmasks,
 }
 
 ControlDeck::~ControlDeck() {
+    // Do NOT call StopRumble() from here. SDLRumbleMapping::StopRumble walks
+    // back through Ship::Context::GetControlDeck() to find its connected
+    // gamepads, and ~ControlDeck runs while Ship::Context is mid-destruction
+    // — the GetControlDeck() copy of the in-flight shared_ptr crashes at the
+    // control-block read (fault_addr=0x40 on macOS arm64). Callers must stop
+    // rumble explicitly before letting Ship::Context tear down (see the
+    // ssb64-port shim in PortShutdown).
     SPDLOG_TRACE("destruct control deck");
+}
+
+void ControlDeck::StopRumble() {
+    for (auto& port : mPorts) {
+        if (port == nullptr) continue;
+        auto controller = port->GetConnectedController();
+        if (controller == nullptr) continue;
+        auto rumble = controller->GetRumble();
+        if (rumble == nullptr) continue;
+        rumble->StopRumble();
+    }
 }
 
 void ControlDeck::Init(uint8_t* controllerBits) {

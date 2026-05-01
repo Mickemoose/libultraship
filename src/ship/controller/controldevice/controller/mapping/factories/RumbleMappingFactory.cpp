@@ -4,6 +4,7 @@
 #include "ship/utils/StringHelper.h"
 #include "ship/Context.h"
 #include "ship/controller/controldeck/ControlDeck.h"
+#include <cstdio>
 
 namespace Ship {
 std::shared_ptr<ControllerRumbleMapping> RumbleMappingFactory::CreateRumbleMappingFromConfig(uint8_t portIndex,
@@ -44,15 +45,32 @@ RumbleMappingFactory::CreateDefaultSDLRumbleMappings(PhysicalDeviceType physical
 std::shared_ptr<ControllerRumbleMapping> RumbleMappingFactory::CreateRumbleMappingFromSDLInput(uint8_t portIndex) {
     std::shared_ptr<ControllerRumbleMapping> mapping = nullptr;
 
-    for (auto [instanceId, gamepad] :
-         Context::GetInstance()->GetControlDeck()->GetConnectedPhysicalDeviceManager()->GetConnectedSDLGamepadsForPort(
-             portIndex)) {
-        if (!SDL_GameControllerHasRumble(gamepad)) {
+    static int sDiagThrottle = 0;
+    auto gamepadsForPort =
+        Context::GetInstance()->GetControlDeck()->GetConnectedPhysicalDeviceManager()->GetConnectedSDLGamepadsForPort(
+            portIndex);
+    if ((sDiagThrottle++ % 60) == 0) {
+        std::fprintf(stderr,
+                     "[RUMBLE-DIAG] CreateRumbleMappingFromSDLInput(port=%u): %zu gamepad(s) visible to this port\n",
+                     (unsigned)portIndex, gamepadsForPort.size());
+    }
+
+    for (auto [instanceId, gamepad] : gamepadsForPort) {
+        bool hasRumble = SDL_GameControllerHasRumble(gamepad);
+        if ((sDiagThrottle % 60) == 1) {
+            std::fprintf(stderr,
+                         "[RUMBLE-DIAG]   port=%u gamepad instanceId=%d hasRumble=%d\n",
+                         (unsigned)portIndex, instanceId, (int)hasRumble);
+        }
+        if (!hasRumble) {
             continue;
         }
 
         for (int32_t button = SDL_CONTROLLER_BUTTON_A; button < SDL_CONTROLLER_BUTTON_MAX; button++) {
             if (SDL_GameControllerGetButton(gamepad, static_cast<SDL_GameControllerButton>(button))) {
+                std::fprintf(stderr,
+                             "[RUMBLE-DIAG]   port=%u button=%d pressed -> creating mapping\n",
+                             (unsigned)portIndex, button);
                 mapping = std::make_shared<SDLRumbleMapping>(portIndex, DEFAULT_LOW_FREQUENCY_RUMBLE_PERCENTAGE,
                                                              DEFAULT_HIGH_FREQUENCY_RUMBLE_PERCENTAGE);
                 break;

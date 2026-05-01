@@ -29,6 +29,12 @@ class ControlDeck {
     bool ProcessKeyboardEvent(KbEventType eventType, KbScancode scancode);
     bool ProcessMouseButtonEvent(bool isPressed, MouseBtn button);
 
+    // Stop rumble on every connected controller. Called from ~ControlDeck so
+    // any teardown path (clean exit, in-game device reset) leaves the gamepad
+    // hardware quiet — SDL_GameControllerRumble's duration=0 means "until
+    // explicitly zeroed", and the OS does not zero it for us on process exit.
+    void StopRumble();
+
     std::shared_ptr<ConnectedPhysicalDeviceManager> GetConnectedPhysicalDeviceManager();
     std::shared_ptr<GlobalSDLDeviceSettings> GetGlobalSDLDeviceSettings();
     std::shared_ptr<ControllerDefaultMappings> GetControllerDefaultMappings();

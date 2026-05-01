@@ -1,5 +1,6 @@
 #include "ship/controller/physicaldevice/ConnectedPhysicalDeviceManager.h"
 #include <spdlog/spdlog.h>
+#include <cstdio>
 
 namespace Ship {
 ConnectedPhysicalDeviceManager::ConnectedPhysicalDeviceManager() {
@@ -54,7 +55,11 @@ void ConnectedPhysicalDeviceManager::RefreshConnectedSDLGamepads() {
     mConnectedSDLGamepadNames.clear();
     static SDL_JoystickGUID sZeroGuid;
 
-    for (int32_t i = 0; i < SDL_NumJoysticks(); i++) {
+    int32_t numJoysticks = SDL_NumJoysticks();
+    std::fprintf(stderr,
+                 "[RUMBLE-DIAG] RefreshConnectedSDLGamepads: SDL_NumJoysticks=%d\n",
+                 numJoysticks);
+    for (int32_t i = 0; i < numJoysticks; i++) {
 
         SDL_JoystickGUID deviceGUID = SDL_JoystickGetDeviceGUID(i);
         if (SDL_memcmp(&deviceGUID, &sZeroGuid, sizeof(deviceGUID)) == 0) {
@@ -67,6 +72,12 @@ void ConnectedPhysicalDeviceManager::RefreshConnectedSDLGamepads() {
 
         char deviceGuidCStr[33] = "";
         SDL_JoystickGetGUIDString(deviceGUID, deviceGuidCStr, sizeof(deviceGuidCStr));
+
+        const char* jsName = SDL_JoystickNameForIndex(i);
+        bool isGC = SDL_IsGameController(i);
+        std::fprintf(stderr,
+                     "[RUMBLE-DIAG]   joystick[%d] guid=%s name=\"%s\" isGameController=%d\n",
+                     i, deviceGuidCStr, jsName ? jsName : "(null)", (int)isGC);
 
         if (!SDL_IsGameController(i)) {
             SPDLOG_WARN("SDL Joystick (GUID: {}) not recognized as gamepad."
@@ -99,6 +110,11 @@ void ConnectedPhysicalDeviceManager::RefreshConnectedSDLGamepads() {
 
         mConnectedSDLGamepads[instanceId] = gamepad;
         mConnectedSDLGamepadNames[instanceId] = gamepadName;
+
+        bool hasRumble = SDL_GameControllerHasRumble(gamepad);
+        std::fprintf(stderr,
+                     "[RUMBLE-DIAG]   opened: instanceId=%d name=\"%s\" hasRumble=%d (auto-assigned to port 0; ignored on ports 1-3)\n",
+                     instanceId, gamepadName.c_str(), (int)hasRumble);
 
         for (uint8_t port = 1; port < 4; port++) {
             mIgnoredInstanceIds[port].insert(instanceId);

@@ -647,6 +647,18 @@ void GfxWindowBackendSDL2::HandleEvents() {
 }
 
 bool GfxWindowBackendSDL2::IsFrameReady() {
+#if defined(__APPLE__)
+    // While AppKit is animating a native fullscreen transition the SDL
+    // CAMetalLayer / NSOpenGLLayer is being reparented between content
+    // views. Submitting new frames into it during that window can
+    // outlive the layer's delegate and cause UAFs in CA::Context (issue
+    // #83). Skip rendering until the transition completes — Fast3dWindow
+    // already treats IsFrameReady=false as a dropped frame and the game
+    // thread keeps advancing.
+    if (isNativeMacOSFullscreenTransitioning()) {
+        return false;
+    }
+#endif
     return true;
 }
 

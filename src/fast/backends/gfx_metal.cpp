@@ -37,6 +37,7 @@
 #include "libultraship/libultra/abi.h"
 #include "ship/Context.h"
 #include "ship/config/ConsoleVariable.h"
+#include "ship/utils/macUtils.h"
 
 #define ARRAY_COUNT(arr) (int32_t)(sizeof(arr) / sizeof(arr[0]))
 
@@ -76,6 +77,15 @@ bool GfxRenderingAPIMetal::MetalInit(SDL_Renderer* renderer) {
 
     mLayer = (CA::MetalLayer*)SDL_RenderGetMetalLayer(renderer);
     mLayer->setPixelFormat(MTL::PixelFormatBGRA8Unorm);
+
+    // Apple-recommended pattern for glitchless rendering across resize and
+    // native fullscreen transitions: drive the drawable's present() inside
+    // the current CoreAnimation transaction (after waitUntilScheduled below),
+    // rather than via -[MTLCommandBuffer presentDrawable:]. Without this the
+    // SDL CAMetalLayer can be reparented mid-flight during macOS fullscreen
+    // animations and crash CA::Context with a UAF on a stale layer delegate
+    // (issue #83). See QuartzCore/CAMetalLayer.presentsWithTransaction docs.
+    macSetMetalLayerPresentsWithTransaction(mLayer, true);
 
     mDevice = mLayer->device();
     mCommandQueue = mDevice->newCommandQueue();
@@ -603,9 +613,15 @@ void GfxRenderingAPIMetal::EndFrame() {
 
     auto screen_framebuffer = mFramebuffers[0];
     screen_framebuffer.mCommandEncoder->endEncoding();
-    screen_framebuffer.mCommandBuffer->presentDrawable(mCurrentDrawable);
+
+    // With presentsWithTransaction enabled (see MetalInit) the drawable must
+    // be presented inside the CoreAnimation transaction, not via the
+    // command-buffer convenience that defers present() until GPU completion.
+    // Pattern from Apple docs: commit, waitUntilScheduled, drawable.present().
     mCurrentVertexBufferPoolIndex = (mCurrentVertexBufferPoolIndex + 1) % kMaxVertexBufferPoolSize;
     screen_framebuffer.mCommandBuffer->commit();
+    screen_framebuffer.mCommandBuffer->waitUntilScheduled();
+    macPresentMetalDrawable(mCurrentDrawable);
 
     mDrawnFramebuffers.clear();
 

@@ -316,6 +316,7 @@ struct RDP {
     uint32_t other_mode_l, other_mode_h;
     uint64_t combine_mode;
     bool grayscale;
+    uint8_t active_material; // PORT: status-effect mod material scope -- registered material id (1..7) armed per fighter draw by the OTR_G_SETMETALMAT sentinel (w1 = id; 0 = none). See GfxMaterial / gfx_register_material.
 
     uint8_t prim_lod_fraction;
     // PORT: G_SETPRIMDEPTH stores a constant Z (and dz) used when other_mode_l has
@@ -705,6 +706,37 @@ extern "C" int gfx_create_framebuffer(uint32_t width, uint32_t height, uint32_t 
 typedef void (*GbiTraceCallbackFn)(uintptr_t w0, uintptr_t w1, int dl_depth);
 extern "C" void gfx_set_trace_callback(GbiTraceCallbackFn callback);
 
+/* PORT: status-effect mod generic fighter-material system. A mod fills a GfxMaterial
+ * descriptor, registers it by id with gfx_register_material, then arms it around
+ * a fighter draw with the OTR_G_SETMETALMAT sentinel (w1 = material id; 0 =
+ * none). While armed the renderer applies the descriptor to the fighter's opaque
+ * parts, so new materials are pure DATA and need no renderer changes.
+ *
+ *   shade_mode:    0 keep, 1 desaturate shade to luma, 2 luma * tint color
+ *   combiner_mode: 0 keep, 1 TEXEL0*SHADE, 2 SHADE-only color (alpha = SHADE)
+ *   lit_only:      1 = lit (G_LIGHTING) parts only, 0 = all opaque parts
+ *
+ * Fields are grouped by size so the layout matches the mod's matching C copy
+ * across the MSVC/TCC boundary -- keep the two definitions in sync. */
+enum { GFX_SHADE_KEEP = 0, GFX_SHADE_LUMA = 1, GFX_SHADE_LUMA_TINT = 2 };
+enum { GFX_COMB_KEEP = 0, GFX_COMB_TEXEL0_SHADE = 1, GFX_COMB_SHADE_ONLY = 2 };
+typedef struct GfxMaterial {
+    const uint8_t* ci8;
+    const uint8_t* tlut_be;
+    uint16_t ci8_w;
+    uint16_t ci8_h;
+    uint16_t texgen_s_scale;
+    uint16_t texgen_t_scale;
+    uint8_t force_texgen;
+    uint8_t shade_mode;
+    uint8_t tint_r;
+    uint8_t tint_g;
+    uint8_t tint_b;
+    uint8_t combiner_mode;
+    uint8_t lit_only;
+    uint8_t _pad;
+} GfxMaterial;
+extern "C" void gfx_register_material(uint32_t id, const GfxMaterial* desc);
 /* Hi-res texture pack hook. Fires once per cache-miss texture upload, after
  * the format-specific N64 decode has produced a tightly-packed RGBA8 buffer
  * (mTexUploadBuffer) of `width * height * 4` bytes that the GPU is about to

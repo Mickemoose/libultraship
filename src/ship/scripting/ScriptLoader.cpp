@@ -259,7 +259,17 @@ void ScriptLoader::CompileAll(const std::optional<std::function<void(const std::
         if (preCallback.has_value()) {
             preCallback.value()(entry);
         }
-        Compile(entry);
+        // Isolate each mod's compile: a single mod that fails to compile/link
+        // must not take down every other scripted mod. Log which one failed
+        // (Compile cleans up its TCCState and does not register the loader on
+        // the throw path, so a skipped mod leaves no partial state) and carry on.
+        try {
+            Compile(entry);
+        } catch (const std::exception& e) {
+            SPDLOG_ERROR("ScriptLoader: mod '{}' failed to compile and was skipped; "
+                         "other mods are unaffected: {}",
+                         info.Name.empty() ? info.Main : info.Name, e.what());
+        }
         if (postCallback.has_value()) {
             postCallback.value()();
         }

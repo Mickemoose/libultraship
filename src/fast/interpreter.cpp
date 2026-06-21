@@ -406,6 +406,46 @@ static UcodeHandlers ucode_handler_index = ucode_f3dex2;
 /* GBI trace callback — forward declaration (defined near g_exec_stack below) */
 static GbiTraceCallbackFn sGbiTraceCallback = nullptr;
 
+// Status-effect mod generic material registry (gfx_register_material). Index 0 is
+// "none"; ids 1..GFX_MAX_MATERIALS-1 hold mod-registered descriptors copied by
+// value. The active id rides mRdp->active_material, armed per fighter draw by the
+// OTR_G_SETMETALMAT sentinel. ImportTexture/GfxSpVertex/GfxSpTri1 read the active
+// descriptor and apply its overrides; chrome and pink are both just descriptors.
+#define GFX_MAX_MATERIALS 8
+static GfxMaterial s_materials[GFX_MAX_MATERIALS] = {};
+static bool s_material_set[GFX_MAX_MATERIALS] = {};
+
+static inline const GfxMaterial* gfx_active_material(uint8_t id) {
+    if (id == 0 || id >= GFX_MAX_MATERIALS || !s_material_set[id]) {
+        return nullptr;
+    }
+    return &s_materials[id];
+}
+
+// Defined further down (near GfxDpSetCombineMode); forward-declared so the chrome
+// path in GfxSpTri1 can build a TEXEL0*SHADE combine_mode the same way.
+static inline uint32_t color_comb(uint32_t a, uint32_t b, uint32_t c, uint32_t d);
+static inline uint32_t alpha_comb(uint32_t a, uint32_t b, uint32_t c, uint32_t d);
+
+// True when the blender is doing alpha blending (translucent XLU/CLD), false for
+// opaque OPA. The chrome material is scoped to opaque body geometry; 2D effects /
+// billboards are XLU, so this keeps chrome off them even though they share renderer
+// state. Matches the use_alpha test in GfxSpTri1; other_mode_l is latched before
+// geometry, so it's valid at G_VTX time too.
+static inline bool BlendUsesAlpha(uint32_t other_mode_l) {
+    return ((other_mode_l & (3 << 20)) == (G_BL_CLR_MEM << 20) &&
+            (other_mode_l & (3 << 16)) == (G_BL_1MA << 16)) ||
+           ((other_mode_l & (3 << 22)) == (G_BL_CLR_MEM << 22) &&
+            (other_mode_l & (3 << 18)) == (G_BL_1MA << 18));
+}
+
+// True when the active material applies to the part currently being drawn: armed,
+// opaque (not XLU), and -- for a lit_only material -- the part is lit. Generalizes
+// the gate the chrome material used to any registered material.
+static inline bool MaterialApplies(const GfxMaterial* m, uint32_t other_mode_l, uint32_t geometry_mode) {
+    return m != nullptr && !BlendUsesAlpha(other_mode_l) &&
+           (!m->lit_only || (geometry_mode & G_LIGHTING));
+}
 /* Hi-res texture pack hook — set by gfx_register_hires_hook(). NULL until
  * the host registers; see ImportTexture for the call site and the docblock
  * on GfxHiResHookFn (interpreter.h) for semantics. */
@@ -1051,6 +1091,7 @@ void Interpreter::ResetRdpTextureState() {
         mRdp->loaded_texture[i].blended = false;
         mRdp->textures_changed[i] = true;
     }
+    mRdp->active_material = 0; // PORT: material scope is re-armed per fighter draw
 }
 
 void Interpreter::TextureCacheDelete(const uint8_t* origAddr) {
@@ -2181,6 +2222,58 @@ void Interpreter::ImportTexture(int i, int tile, bool importReplacement) {
     uint16_t tileHeight =
         (uint16_t)(int32_t)((mRdp->texture_tile[tile].lrt - mRdp->texture_tile[tile].ult + 4) / 4);
 
+    // PORT: status-effect mod material. While a ci8-bearing material is armed, redirect
+    // this joint texture to the material's CI8 ramp + big-endian RGBA16 TLUT, so
+    // the existing CI8 decode path (ImportTextureCi8) reads the ramp instead. We
+    // patch both the RDP state the decoder re-reads and the locals below that build
+    // the cache key / pick the decode switch branch.
+    const GfxMaterial* importMat = gfx_active_material(mRdp->active_material);
+    if (importMat != nullptr && importMat->ci8 != nullptr &&
+        MaterialApplies(importMat, mRdp->other_mode_l, mRsp->geometry_mode) && i >= 0 && i < 2) {
+        const uint32_t kW = importMat->ci8_w, kH = importMat->ci8_h, kSize = kW * kH;
+        uint32_t maskw = 0, maskh = 0;
+        while ((1u << maskw) < kW) maskw++;
+        while ((1u << maskh) < kH) maskh++;
+        auto& tt = mRdp->texture_tile[tile];
+        tt.fmt = G_IM_FMT_CI;
+        tt.siz = G_IM_SIZ_8b;
+        tt.palette = 0;
+        tt.cms = 2; // G_TX_CLAMP
+        tt.cmt = 2;
+        tt.masks = maskw;
+        tt.maskt = maskh;
+        tt.shifts = 0;
+        tt.shiftt = 0;
+        tt.uls = 0;
+        tt.ult = 0;
+        tt.lrs = (float)((kW - 1) * 4);
+        tt.lrt = (float)((kH - 1) * 4);
+        tt.line_size_bytes = kW;
+
+        auto& lt = mRdp->loaded_texture[tmemIdex];
+        lt.addr = importMat->ci8;
+        lt.line_size_bytes = kW;
+        lt.full_image_line_size_bytes = kW;
+        lt.size_bytes = kSize;
+        lt.orig_size_bytes = kSize;
+        lt.tex_flags = 0;
+        lt.masked = false;
+        lt.blended = false;
+
+        mRdp->palettes[0] = importMat->tlut_be;
+        mRdp->palettes[1] = importMat->tlut_be + 256;
+        mRdp->palette_dram_addr[0] = importMat->ci8;
+        mRdp->palette_dram_addr[1] = importMat->ci8 + 1;
+
+        fmt = G_IM_FMT_CI;
+        siz = G_IM_SIZ_8b;
+        texFlags = 0;
+        paletteIndex = 0;
+        origSizeBytes = kSize;
+        tileWidth = (uint16_t)kW;
+        tileHeight = (uint16_t)kH;
+    }
+
     // Check TLUT mode early -- before cache lookup -- so the fmt override
     // affects both the cache key and the decode path.
     // Only override to CI for 4-bit and 8-bit texels, which are valid CI sizes.
@@ -2647,6 +2740,12 @@ void Interpreter::AdjustWidthHeightForScale(uint32_t& width, uint32_t& height, u
 }
 
 void Interpreter::GfxSpVertex(size_t n_vertices, size_t dest_index, const F3DVtx* vertices) {
+    // Chrome material applies to opaque, LIT body geometry only. Every fighter body
+    // part inherits the skeleton's G_LIGHTING; 2D effects/sprites/billboards and the
+    // afterimage trail draw with G_LIGHTING cleared -- so the original geometry-mode
+    // bit (read before the force below ORs it into a local) cleanly excludes them.
+    const GfxMaterial* mat = gfx_active_material(mRdp->active_material);
+    bool mat_on = MaterialApplies(mat, mRdp->other_mode_l, mRsp->geometry_mode);
     for (size_t i = 0; i < n_vertices; i++, dest_index++) {
         const F3DVtx_t* v = &vertices[i].v;
         const F3DVtx_tn* vn = &vertices[i].n;
@@ -2678,7 +2777,14 @@ void Interpreter::GfxSpVertex(size_t n_vertices, size_t dest_index, const F3DVtx
         short U = v->tc[0] * mRsp->texture_scaling_factor.s >> 16;
         short V = v->tc[1] * mRsp->texture_scaling_factor.t >> 16;
 
-        if (mRsp->geometry_mode & G_LIGHTING) {
+        // PORT: chrome material forces env-mapped texgen (lighting + texgen)
+        // even on joints whose geometry mode doesn't set them.
+        uint32_t geo = mRsp->geometry_mode;
+        if (mat_on && mat->force_texgen) {
+            geo |= (G_LIGHTING | G_TEXTURE_GEN);
+        }
+
+        if (geo & G_LIGHTING) {
             if (mRsp->lights_changed) {
                 for (int i = 0; i < mRsp->current_num_lights - 1; i++) {
                     CalculateNormalDir(&mRsp->current_lights[i].l, mRsp->current_lights_coeffs[i]);
@@ -2750,7 +2856,7 @@ void Interpreter::GfxSpVertex(size_t n_vertices, size_t dest_index, const F3DVtx
             d->color.g = g > 255 ? 255 : g;
             d->color.b = b > 255 ? 255 : b;
 
-            if (mRsp->geometry_mode & G_TEXTURE_GEN) {
+            if (geo & G_TEXTURE_GEN) {
                 float dotx = 0, doty = 0;
                 dotx += vn->n[0] * mRsp->current_lookat_coeffs[0][0];
                 dotx += vn->n[1] * mRsp->current_lookat_coeffs[0][1];
@@ -2778,13 +2884,40 @@ void Interpreter::GfxSpVertex(size_t n_vertices, size_t dest_index, const F3DVtx
                     doty = (doty + 1.0f) / 4.0f;
                 }
 
-                U = (int32_t)(dotx * mRsp->texture_scaling_factor.s);
-                V = (int32_t)(doty * mRsp->texture_scaling_factor.t);
+                // PORT: chrome material forces Metal Mario's exact texgen UV
+                // scale so the sphere-map lands on the 48x42 ramp instead of
+                // overshooting to its dark border (the joint's own skin scale
+                // is far too large for the 48x42 chrome texture).
+                int32_t ts = mRsp->texture_scaling_factor.s;
+                int32_t tt2 = mRsp->texture_scaling_factor.t;
+                if (mat_on && mat->force_texgen) {
+                    ts = mat->texgen_s_scale;
+                    tt2 = mat->texgen_t_scale;
+                }
+                U = (int32_t)(dotx * ts);
+                V = (int32_t)(doty * tt2);
             }
         } else {
             d->color.r = v->cn[0];
             d->color.g = v->cn[1];
             d->color.b = v->cn[2];
+        }
+
+        // PORT: vanilla fighters tint flat parts via a colored material light
+        // (mobj light1/light2 color), which the chrome combiner would multiply
+        // into the ramp (brown boots, green tunic). Desaturate shade to luma so
+        // chrome keeps lighting intensity but loses the hue.
+        if (mat_on && mat->shade_mode != GFX_SHADE_KEEP) {
+            uint8_t luma = (uint8_t)((d->color.r * 77 + d->color.g * 150 + d->color.b * 29) >> 8);
+            if (mat->shade_mode == GFX_SHADE_LUMA_TINT) {
+                d->color.r = (uint8_t)((luma * mat->tint_r) / 255);
+                d->color.g = (uint8_t)((luma * mat->tint_g) / 255);
+                d->color.b = (uint8_t)((luma * mat->tint_b) / 255);
+            } else {
+                d->color.r = luma;
+                d->color.g = luma;
+                d->color.b = luma;
+            }
         }
 
         d->u = U;
@@ -2945,10 +3078,13 @@ void Interpreter::GfxSpTri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx
 
     uint64_t cc_id = mRdp->combine_mode;
     uint64_t cc_options = 0;
-    bool use_alpha = ((mRdp->other_mode_l & (3 << 20)) == (G_BL_CLR_MEM << 20) &&
-                      (mRdp->other_mode_l & (3 << 16)) == (G_BL_1MA << 16)) ||
-                     ((mRdp->other_mode_l & (3 << 22)) == (G_BL_CLR_MEM << 22) &&
-                      (mRdp->other_mode_l & (3 << 18)) == (G_BL_1MA << 18));
+    bool use_alpha = BlendUsesAlpha(mRdp->other_mode_l);
+    // Chrome material applies to opaque, LIT body geometry only -- the G_LIGHTING bit
+    // (original geometry mode) excludes 2D effects/sprites/billboards and the
+    // afterimage trail, which all draw G_LIGHTING-off. Computed before the
+    // texture_edge override below mutates use_alpha.
+    const GfxMaterial* mat = gfx_active_material(mRdp->active_material);
+    bool mat_on = mat != nullptr && !use_alpha && (!mat->lit_only || (mRsp->geometry_mode & G_LIGHTING));
     uint8_t blend_src = mRdp->other_mode_l >> 30;
     bool use_blend_color = blend_src == G_BL_CLR_BL;
     bool use_fog = blend_src == G_BL_CLR_FOG || use_blend_color;
@@ -3017,11 +3153,43 @@ void Interpreter::GfxSpTri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx
     key.options = cc_options;
     key.shader_id = 0;
 
+    // PORT: chrome material. A flat/vertex-colored joint uses a SHADE-only combiner
+    // that never samples TEXEL0, so force MODULATERGB (TEXEL0*SHADE) while armed and
+    // every part reads the redirected chrome ramp. Leave cc_options/_2CYC untouched:
+    // forcing _2CYC against 1-cycle/1-texture state is what made the old combiner
+    // generate an uncompilable shader (the fighter went invisible). Drop the mask/
+    // blend opts too -- they're keyed off the pre-redirect texture, not the chrome.
+    if (mat_on && mat->combiner_mode != GFX_COMB_KEEP) {
+        if (mat->combiner_mode == GFX_COMB_SHADE_ONLY) {
+            key.combine_mode = (uint64_t)color_comb(G_CCMUX_0, G_CCMUX_0, G_CCMUX_0, G_CCMUX_SHADE) |
+                               ((uint64_t)alpha_comb(G_ACMUX_0, G_ACMUX_0, G_ACMUX_0, G_ACMUX_SHADE) << 16);
+        } else {
+            key.combine_mode = (uint64_t)color_comb(G_CCMUX_TEXEL0, G_CCMUX_0, G_CCMUX_SHADE, G_CCMUX_0) |
+                               ((uint64_t)alpha_comb(G_ACMUX_0, G_ACMUX_0, G_ACMUX_0, G_ACMUX_SHADE) << 16);
+        }
+        key.options &= ~(SHADER_OPT(TEXEL0_MASK) | SHADER_OPT(TEXEL0_BLEND));
+    }
+
     ColorCombiner* comb = LookupOrCreateColorCombiner(key);
+
+    // PORT: an untextured joint issues no G_SETTIMG, so textures_changed[0] stays
+    // false and the chrome redirect in ImportTexture never runs. Force the slot-0
+    // import while armed (the combiner above already set usedTextures[0]) so chrome
+    // binds on these joints too.
+    if (mat_on && mat->ci8 != nullptr && comb->usedTextures[0]) {
+        mRdp->textures_changed[0] = true;
+    }
 
     uint32_t tm = 0;
     uint32_t tex_width[2], tex_height[2], tex_width2[2], tex_height2[2];
     uint32_t effective_tile[2];
+
+    // PORT: the chrome redirect repoints palettes[] at the chrome TLUT (opaque). A
+    // later CI sprite that reuses a previously-loaded TLUT (e.g. a 2D effect billboard
+    // drawn after this fighter) would otherwise decode through chrome's opaque palette
+    // and lose its transparency. Restore the palette pointers after the import.
+    const uint8_t* metalSavedPal[2] = { mRdp->palettes[0], mRdp->palettes[1] };
+    const uint8_t* metalSavedPda[2] = { mRdp->palette_dram_addr[0], mRdp->palette_dram_addr[1] };
 
     for (int i = 0; i < 2; i++) {
         uint32_t tile = mRdp->first_tile_index + i;
@@ -3148,6 +3316,13 @@ void Interpreter::GfxSpTri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx
                 mRenderingState.mTextures[i]->second.cmt = cmt;
             }
         }
+    }
+
+    if (mat_on && mat->ci8 != nullptr) {
+        mRdp->palettes[0] = metalSavedPal[0];
+        mRdp->palettes[1] = metalSavedPal[1];
+        mRdp->palette_dram_addr[0] = metalSavedPda[0];
+        mRdp->palette_dram_addr[1] = metalSavedPda[1];
     }
 
     struct ShaderProgram* prg = comb->prg[tm];
@@ -3823,7 +3998,7 @@ void Interpreter::GfxDpLoadTlut(uint8_t tile, uint32_t high_index) {
     // PORT: real N64 RDP LOADTLUT always transfers 16-bit TLUT entries
     // regardless of the SetTextureImage siz, so a non-16b siz is hardware-
     // tolerated rather than fatal. libultraship's hard SUPPORT_CHECK turned it
-    // into a debug-build abort that the SR synth winner-logo emblem trips on the
+    // into a debug-build abort that a custom fighter's winner-logo emblem trips on the
     // VS-results screen. The load below already derives its byte count from
     // 16-bit entries, so warn (throttled, with context to confirm the source)
     // and load it as 16b like hardware instead of aborting.
@@ -5271,19 +5446,32 @@ bool gfx_dl_handler_common(F3DGfx** cmd0) {
          * SIGSEGV per crash, which the WALKED_PAST guard plus the
          * gcDrawMObjForDObj G_ENDDL terminator (decomp side) avoid in
          * the cases we've measured. */
+        /* RELAXED 2026-06-19 (port-owner request): do NOT reject a WALKED_PAST push.
+         * The supersedes the "reject" wording in the comment above. A WALKED_PAST
+         * classification (subGFX within 64KB past the END of a registered reloc range)
+         * FALSE-rejects legitimate mod-synthesized display lists that happen to be
+         * malloc'd near a reloc range -> they silently don't draw, heap-layout
+         * dependent (an item mod's item names, vanilla series emblems, a status-effect mod's metal-cap
+         * cube, and any future mod DL). The early push-side reject was a belt-and-
+         * suspenders catch for a genuine runaway DL (no gsSPEndDisplayList) walking
+         * off a range; that case is STILL caught one level down by gfx_step's
+         * walk-side WALKED_PAST guard, which stops the walk when a DL actually steps
+         * past its own range end. So allow the push and let the walk-side guard be the
+         * sole arbiter. A legitimate (properly terminated) mod DL just past a range now
+         * renders; a real runaway is still stopped (just at walk time, not push time).
+         * Keep a rate-limited breadcrumb (no per-push diag — these are now expected). */
         uintptr_t subAddr = (uintptr_t)subGFX;
         if (sDLBoundsCheck && sDLBoundsCheck(subAddr) == kDLBoundsWalkedPast) {
-            static int sRejectCount = 0;
-            if (sRejectCount < 10) {
-                sRejectCount++;
-                SPDLOG_WARN("gfx_dl_handler: rejecting DL push just past a "
-                            "registered range (w1=0x{:x}, subGFX=0x{:x}) — "
-                            "would have walked into unmapped memory",
+            static int sAllowWarnCount = 0;
+            if (sAllowWarnCount < 5) {
+                sAllowWarnCount++;
+                SPDLOG_INFO("gfx_dl_handler: allowing DL push just past a registered "
+                            "range (w1=0x{:x}, subGFX=0x{:x}) — relying on gfx_step "
+                            "walk-side guard (push-side reject relaxed)",
                             (unsigned long long)cmd->words.w1,
                             (unsigned long long)subAddr);
-                Fast::DumpDLDiag(subGFX, "gfx_dl_handler: walked-past");
             }
-            return false;
+            /* fall through: do NOT return false */
         }
     }
 
@@ -5555,6 +5743,39 @@ bool gfx_set_timg_handler_rdp(F3DGfx** cmd0) {
     uint32_t texFlags = 0;
     RawTexMetadata rawTexMetdata = {};
 
+    // Catch unresolved low-32-bit pointers BEFORE handing them to the OTR
+    // signature check. SegAddr can return a raw value back — either an N64
+    // segment-encoded address whose segment isn't bound at this moment, or
+    // a stale token / chain-encoded slot value that decodes through every
+    // SegAddr branch unsuccessfully — in which case `imgData` is a low
+    // 32-bit value with no valid host-pointer mapping. Without this guard
+    // gfx_check_image_signature dereferences the bogus pointer (POSIX
+    // gfxPointerHasReadableBytes is a no-op) and segfaults.
+    //
+    // The original guard at `if (i <= 0x0FFFFFFF) return false;` below was
+    // (a) too narrow — it only covered the strict N64 segmented range,
+    // missing values like 0x3596da68 that fit no segment but are still
+    // not host-mapped — and (b) placed AFTER the OTR sig check, so the
+    // bogus pointer crash happened before the guard could fire.
+    //
+    // On 64-bit hosts every valid mmap'd pointer is above 4 GB; anything
+    // below is unresolvable. On a 32-bit host the original 256 MB N64
+    // segmented-range cap is the right threshold.
+    //
+    // Exception: if the address lies inside a loaded PE/ELF module, it's
+    // a real `.rodata` texture from a TCC mod whose DLL got loaded at a
+    // low preferred base. Accepting those lets mods use static texture
+    // data without a heap-copy workaround.
+#if UINTPTR_MAX > 0xFFFFFFFFu
+    if (i != 0 && i < 0x100000000ull && !gfxPointerInLoadedModule(reinterpret_cast<const void*>(i))) {
+        return false;
+    }
+#else
+    if (i <= 0x0FFFFFFF && !gfxPointerInLoadedModule(reinterpret_cast<const void*>(i))) {
+        return false;
+    }
+#endif
+
     if ((i & 1) != 1) {
         if (gfx_check_image_signature(imgData) == 1) {
             std::shared_ptr<Fast::Texture> tex = std::static_pointer_cast<Fast::Texture>(
@@ -5810,6 +6031,14 @@ bool gfx_set_grayscale_handler_custom(F3DGfx** cmd0) {
     F3DGfx* cmd = *cmd0;
 
     gfx->mRdp->grayscale = cmd->words.w1;
+    return false;
+}
+
+bool gfx_set_metal_mat_handler_custom(F3DGfx** cmd0) {
+    Interpreter* gfx = mInstance.lock().get();
+    F3DGfx* cmd = *cmd0;
+
+    gfx->mRdp->active_material = (uint8_t)cmd->words.w1;
     return false;
 }
 
@@ -6194,6 +6423,7 @@ static constexpr UcodeHandler otrHandlers = {
     { OTR_G_TEXRECT_WIDE, { "G_TEXRECT_WIDE", gfx_tex_rect_wide_handler_custom } },          // G_TEXRECT_WIDE (0x37)
     { OTR_G_FILLWIDERECT, { "G_FILLWIDERECT", gfx_fill_wide_rect_handler_custom } },         // G_FILLWIDERECT (0x38)
     { OTR_G_SETGRAYSCALE, { "G_SETGRAYSCALE", gfx_set_grayscale_handler_custom } },          // G_SETGRAYSCALE (0x39)
+    { OTR_G_SETMETALMAT, { "G_SETMETALMAT", gfx_set_metal_mat_handler_custom } },            // G_SETMETALMAT (0x47)
     { OTR_G_EXTRAGEOMETRYMODE,
       { "G_EXTRAGEOMETRYMODE", gfx_extra_geometry_mode_handler_custom } }, // G_EXTRAGEOMETRYMODE (0x3a)
     { OTR_G_COPYFB, { "G_COPYFB", gfx_copy_fb_handler_custom } },          // G_COPYFB (0x3b)
@@ -6713,6 +6943,14 @@ void Interpreter::StartFrame() {
 }
 
 GfxExecStack g_exec_stack = {};
+
+extern "C" void gfx_register_material(uint32_t id, const GfxMaterial* desc) {
+    if (id == 0 || id >= GFX_MAX_MATERIALS || desc == nullptr) {
+        return;
+    }
+    s_materials[id] = *desc;
+    s_material_set[id] = true;
+}
 
 extern "C" void gfx_set_trace_callback(GbiTraceCallbackFn callback) {
     sGbiTraceCallback = callback;
